@@ -25,16 +25,18 @@ from compliments import COMPLIMENTS, NAMES
 # Токен от @BotFather. Вставь его сюда между кавычками.
 TOKEN = os.environ.get("BOT_TOKEN", "СЮДА_ВСТАВЬ_ТОКЕН")
 
-# Комплимент дня: во сколько присылать (часы:минуты).
-DAILY_TIME = "09:00"
+# Как часто присылать комплименты, в часах. Поставь 2 или 3 — как захочешь.
+EVERY_HOURS = 3
+
+# Дневное окно: с какого часа начинать и до какого можно писать.
+# 9 и 24 значит "с девяти утра и до полуночи", ночью бот молчит.
+DAY_START_HOUR = 9
+DAY_END_HOUR = 24
 
 # Часовой пояс, в котором указано время выше. Ташкент = 5 (UTC+5).
-# Нужно потому, что сервер хостинга обычно живёт по UTC.
 TZ_OFFSET_HOURS = 5
 
-# Файл, где бот запоминает, кому слать комплимент дня и что уже присылал.
-# На Railway путь задаётся переменной STATE_FILE (например /data/state.json),
-# чтобы память не терялась при перезапуске.
+# Файл, где бот хранит память. На Railway задаётся переменной STATE_FILE.
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 
 # ─────────────────────────────────────────────
@@ -50,7 +52,7 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"daily": [], "used": {}, "last_daily": ""}
+    return {"daily": [], "used": {}, "sent": []}
 
 
 def save_state(state):
@@ -68,8 +70,7 @@ STATE = load_state()
 
 
 def make_compliment(chat_id):
-    """Достаёт комплимент, который этому чату ещё не приходил.
-    Когда все 500 закончатся — список начинается заново."""
+    """Достаёт комплимент, который этому чату ещё не приходил."""
     chat_id = str(chat_id)
     with _lock:
         used = set(STATE["used"].get(chat_id, []))
@@ -83,7 +84,6 @@ def make_compliment(chat_id):
 
     name = random.choice(NAMES)
     text = COMPLIMENTS[idx]
-    # если комплимент начинается с обращения — делаем первую букву заглавной
     if text.startswith("{n}"):
         name = name[0].upper() + name[1:]
     return text.replace("{n}", name)
@@ -92,7 +92,7 @@ def make_compliment(chat_id):
 def keyboard():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(types.KeyboardButton("💛 Комплимент"))
-    kb.add(types.KeyboardButton("☀️ Комплимент дня: вкл/выкл"))
+    kb.add(types.KeyboardButton("☀️ Комплименты по расписанию"))
     return kb
 
 
@@ -113,7 +113,7 @@ def help_cmd(message):
     bot.send_message(
         message.chat.id,
         "Просто напиши что угодно или нажми кнопку — пришлю комплимент.\n"
-        "/daily — включить или выключить комплимент дня\n"
+        "/daily — включить или выключить комплименты по расписанию\n"
         "/reset — обнулить историю, чтобы всё пошло по новой",
         reply_markup=keyboard(),
     )
@@ -142,18 +142,27 @@ def toggle_daily(chat_id):
             on = True
         save_state(STATE)
     if on:
-        bot.send_message(chat_id, f"Готово, буду писать каждый день в {DAILY_TIME} ☀️")
+        hours = ", ".join(f"{h:02d}:00" for h in schedule_times())
+        bot.send_message(
+            chat_id,
+            f"Готово ☀️ Буду писать каждые {EVERY_HOURS} ч: {hours}.\nНочью не бужу.",
+        )
     else:
-        bot.send_message(chat_id, "Хорошо, комплимент дня выключен.")
+        bot.send_message(chat_id, "Хорошо, по расписанию больше не пишу.")
 
 
 @bot.message_handler(func=lambda m: True)
 def any_message(message):
-    if message.text and "Комплимент дня" in message.text:
+    if message.text and "по расписанию" in message.text:
         toggle_daily(message.chat.id)
         return
     bot.send_message(message.chat.id, make_compliment(message.chat.id),
                      reply_markup=keyboard())
+
+
+def schedule_times():
+    """Список часов, в которые бот пишет. Например [9, 12, 15, 18, 21]."""
+    return list(range(DAY_START_HOUR, DAY_END_HOUR, EVERY_HOURS))
 
 
 def local_now():
@@ -161,30 +170,32 @@ def local_now():
     return datetime.utcnow() + timedelta(hours=TZ_OFFSET_HOURS)
 
 
-def daily_loop():
-    """Раз в 30 секунд проверяет время и рассылает комплимент дня."""
+def schedule_loop():
+    """Раз в минуту проверяет: не пора ли отправить очередной комплимент."""
     while True:
         try:
-            now = local_now().strftime("%H:%M")
-            today = local_now().strftime("%Y-%m-%d")
-            if now == DAILY_TIME and STATE.get("last_daily") != today:
+            now = local_now()
+            for hour in schedule_times():
+                if now.hour != hour or now.minute >= 10:
+                    continue
+                slot = now.strftime("%Y-%m-%d ") + str(hour)
+                if slot in STATE.get("sent", []):
+                    continue
                 for chat_id in list(STATE["daily"]):
                     try:
-                        bot.send_message(chat_id, "☀️ " + make_compliment(chat_id))
+                        bot.send_message(chat_id, make_compliment(chat_id))
                     except Exception as e:
                         print("не смог отправить:", e)
                 with _lock:
-                    STATE["last_daily"] = today
+                    STATE.setdefault("sent", []).append(slot)
+                    STATE["sent"] = STATE["sent"][-30:]
                     save_state(STATE)
         except Exception as e:
-            print("ошибка в рассылке:", e)
-        time.sleep(30)
+            print("ошибка в расписании:", e)
+        time.sleep(60)
 
 
 class PingHandler(BaseHTTPRequestHandler):
-    """Крошечная веб-страничка. Нужна только для хостингов вроде Render:
-    они требуют, чтобы приложение слушало порт, и «будят» его по запросу."""
-
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -198,12 +209,13 @@ class PingHandler(BaseHTTPRequestHandler):
 def start_web_server():
     port = os.environ.get("PORT")
     if not port:
-        return  # локально веб-сервер не нужен
+        return
     HTTPServer(("0.0.0.0", int(port)), PingHandler).serve_forever()
 
 
 if __name__ == "__main__":
     print(f"Бот запущен. Комплиментов: {len(COMPLIMENTS)}, обращений: {len(NAMES)}")
-    threading.Thread(target=daily_loop, daemon=True).start()
+    print("Расписание:", ", ".join(f"{h:02d}:00" for h in schedule_times()))
+    threading.Thread(target=schedule_loop, daemon=True).start()
     threading.Thread(target=start_web_server, daemon=True).start()
     bot.infinity_polling(skip_pending=True)
